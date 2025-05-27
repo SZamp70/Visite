@@ -1,0 +1,85 @@
+<!DOCTYPE html><html lang="it"><head><meta charset="utf-8">
+<title>Scheduler visite mediche (v20)</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;margin:20px;max-width:960px;}
+label{display:block;margin:6px 0;} table{border-collapse:collapse;width:100%;margin-top:16px;font-size:13px;}
+th,td{border:1px solid #999;padding:6px;} th{background:#eee;}
+.err{color:#b00;font-weight:bold;margin-top:12px;} #dbg{white-space:pre;font-size:12px;color:#555;margin-top:12px;}
+</style></head><body>
+<h2>Scheduler visite mediche</h2>
+<label>File turni: <input type="file" id="fTurni"></label>
+<label>File scadenze: <input type="file" id="fScad"></label>
+<button id="run">Calcola</button>
+
+<div id="out"></div><div id="dbg"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+<script>
+const YEAR   = 2025;
+const DAYROW = 3;          // riga 4 in Excel (0-based → 3)
+const FIRSTC = XLSX.utils.decode_col('O');   // colonna O → indice 14
+const LAST_DATE = new Date('2025-12-31');
+const today = new Date(); today.setHours(0,0,0,0);
+
+/* normalizza “COGNOME X.” */
+const norm = s=>(s||'').replace(/\s+/g,' ').toUpperCase()
+                      .replace(/[^A-ZÀ-Ü\s\.]/gi,'')
+                      .match(/^[A-ZÀ-Ü]+ \S\./)?.[0]||'';
+
+run.onclick = async ()=>{
+  out.textContent=''; dbg.textContent='';
+  const tf=fTurni.files[0], sf=fScad.files[0];
+  if(!tf||!sf){out.innerHTML='<p class=err>Carica entrambi i file</p>';return;}
+
+  /* carica turni */
+  const wbT=XLSX.read(await tf.arrayBuffer(),{type:'array'});
+  const wsT=wbT.Sheets[wbT.SheetNames[0]];
+  const T=XLSX.utils.sheet_to_json(wsT,{
+      header:1, defval:'', raw:false, blankrows:false, cellText:true,
+      value:c=>c.v!==undefined&&c.v!==''?c.v:(c.w||'')
+  });
+
+  /* mappa colonna → data (incrementale dal 1° gennaio) */
+  const colDate={}, oneDay=86400000;
+  for(let c=FIRSTC,d=new Date(YEAR,0,1); c<T[DAYROW].length; c++,d=new Date(+d+oneDay)){
+    colDate[c]=d;
+  }
+
+  /* candidati turno mattina */
+  const isTurno1 = v=>{
+    if(typeof v==='number') return v===1;
+    const t=v.toString().trim().toUpperCase();
+    return /^1/.test(t);
+  };
+  const cand={};
+  for(let r=DAYROW+1;r<T.length;r++){
+    const key=norm(T[r][0]); if(!key)continue;
+    for(const [cStr,dt] of Object.entries(colDate)){
+      const c=+cStr; if(dt<today||dt>LAST_DATE)continue;
+      if([3,4].indexOf(dt.getDay())===-1)continue;   // mer/giov
+      if(isTurno1(T[r][c])) (cand[key]=cand[key]||[]).push(dt);
+    }
+  }
+
+  /* carica scadenze */
+  const wbS=XLSX.read(await sf.arrayBuffer(),{type:'array',cellDates:true});
+  const S=XLSX.utils.sheet_to_json(wbS.Sheets[wbS.SheetNames[0]],{raw:true,defval:''});
+  const fmt=d=>`${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
+
+  const rows=[];
+  S.forEach(r=>{
+    const raw=(r.Nome||r[0]||'').trim(), key=norm(raw);
+    let exp=r.Scadenza||r[1];
+    if(typeof exp==='number'){const o=XLSX.SSF.parse_date_code(exp);exp=new Date(o.y,o.m-1,o.d);}
+    if(!(exp instanceof Date)||isNaN(exp)) return;
+    const list=cand[key]?.filter(d=>d<=exp) || [];
+    rows.push({Nome:raw,Scadenza:fmt(exp),Visita:list.length?fmt(list[list.length-1]):'ND'});
+  });
+
+  out.innerHTML=XLSX.utils.sheet_to_html(XLSX.utils.json_to_sheet(rows));
+  dbg.textContent=
+`Colonne totali: ${T[DAYROW].length}
+Dipendenti con turno1 mer/giov: ${Object.keys(cand).length}
+Visite assegnate: ${rows.filter(r=>r.Visita!=='ND').length}`;
+};
+</script></body></html>

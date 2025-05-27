@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<title>Scheduler visite mediche</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;margin:20px;max-width:900px;}
+label{display:block;margin:6px 0;}
+table{border-collapse:collapse;width:100%;margin-top:20px;font-size:14px;}
+th,td{border:1px solid #999;padding:6px;text-align:left;}
+th{background:#eee;}
+#downloadLink{display:inline-block;margin-top:12px;}
+.error{color:#b00;font-weight:bold;margin-top:12px;}
+pre{background:#f7f7f7;padding:6px;font-size:12px;overflow-x:auto;}
+</style>
+</head>
+<body>
+<h2>Scheduler visite mediche</h2>
+
+<p>
+Carica il file dei <strong>turni</strong> (<code>.xlsm/.xlsx</code>, nel formato originale) e il file con le
+<strong>scadenze</strong> (<code>.xlsx</code>, colonne Nome+Scadenza).<br>
+Il tool troverà, per ciascun dipendente, la <em>mattina utile di mercoledì o giovedì (turno “1*”)</em>
+più vicina (o più lontana) alla scadenza.<br>
+Tutto avviene <u>in locale</u>. Se il proxy blocca i CDN, metti <code>xlsx.full.min.js</code> accanto a questo HTML.
+</p>
+
+<label>File turni: <input type="file" id="turniFile" accept=".xls,.xlsx,.xlsm" required></label>
+<label>File scadenze: <input type="file" id="scadenzeFile" accept=".xls,.xlsx" required></label>
+<label>Anno di calendario (es. 2025): <input type="number" id="year" value="2025"></label>
+<label>Strategia:
+    <select id="strategy">
+        <option value="latest" selected>Più avanti possibile</option>
+        <option value="earliest">Prima possibile</option>
+    </select>
+</label>
+<label>Giorni di anticipo minimo: <input type="number" id="buffer" value="0"></label>
+<button type="button" id="runBtn">Calcola</button>
+
+<div id="output"></div>
+
+<!-- 1) CDN (senza numero versione, sempre ultima stabile) -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+<!-- 2) Fallback locale -->
+<script>
+if(typeof XLSX==='undefined'){
+  const s=document.createElement('script');
+  s.src='./xlsx.full.min.js';
+  document.head.appendChild(s);
+}
+</script>
+
+<script>
+document.getElementById('runBtn').addEventListener('click', async ()=>{
+  clearOut();
+
+  // 0. Verifica libreria
+  if(typeof XLSX==='undefined'){
+      err('La libreria XLSX non è stata caricata (CDN e fallback assenti).');
+      return;
+  }
+
+  // 1. Recupero parametri
+  const fTurni=document.getElementById('turniFile').files[0];
+  const fScad =document.getElementById('scadenzeFile').files[0];
+  if(!fTurni||!fScad){err('Seleziona entrambi i file.');return;}
+
+  const year   =+document.getElementById('year').value||2025;
+  const strat  = document.getElementById('strategy').value;
+  const buffer =+document.getElementById('buffer').value||0;
+
+  try{
+    // 2. Lettura Workbook
+    const wbTurni = await toWb(fTurni);
+    const wbScad  = await toWb(fScad);
+
+    // 3. Calcolo
+    const res = calc(wbTurni, wbScad, year, strat, buffer);
+
+    // 4. Output
+    if(!res.rows.length){
+        err('Nessun risultato – probabilmente i nomi non combaciano oppure i turni mattina non iniziano con "1".');
+        console.warn('DEBUG>', res.debug);
+        return;
+    }
+    table(res.rows); download(res.rows);
+    console.info('DEBUG>', res.debug);   // Mostra statistiche in console
+  }catch(e){
+    console.error(e);
+    err('Errore: '+e.message);
+  }
+});
+
+async function toWb(file){
+  const buf=await file.arrayBuffer();
+  return XLSX.read(buf,{type:'array'});
+}
+
+/* === PARSER PRINCIPALE ============================================================== */
+function calc(wbTurni, wbScad, year, strat, bufDays){
+  const dbg={};                    // oggetto con statistiche che logghiamo in console
+  const oneDay=86400000;
+
+  /* --- 1. Turni ------------------------------------------------------------------- */
+  const sheetTurni = wbTurni.Sheets[wbTurni.SheetNames[0]];
+  const T = XLSX.utils.sheet_to_json(sheetTurni,{header:1,raw:false});
+  dbg.totalRowsTurni=T.length;
+
+  // 1a. Individua riga con i NUMERI dei giorni (>= 5 numeri tra 1-31, non serve siano consecutivi)
+  let dayRow=-1;
+  for(let r=0;r<T.length;r++){
+    let nums=0;
+    for(let c=0;c<T[r].length;c++){
+      const v=(T[r][c]||'').toString().trim();
+      if(/^\d{1,2}$/.test(v)) nums++;
+    }
+    if(nums>=5){ dayRow=r; break; }
+  }
+  if(dayRow===-1) throw new Error('Non trovo la riga con i numeri dei giorni nel file turni.');
+
+  // 1b. Costruisci mappa colonna ➜ data effettiva
+  const dayNums=T[dayRow];
+  const colDate={}, drow=dayNums.length;
+  let month=0;
+  for(let c=1;c<drow;c++){
+    const cell=(dayNums[c]||'').toString().trim();
+    if(!/^\d{1,2}$/.test(cell)) continue;
+    const d=+cell;
+    if(d===1 && c!==1) month++;          // passa al mese successivo
+    colDate[c]=new Date(year, month, d);
+  }
+  dbg.columnsWithDates=Object.keys(colDate).length;
+
+  // 1c. Raccogli candidati per ciascun dipendente
+  const candidates={};
+  for(let r=dayRow+1;r<T.length;r++){
+    const row=T[r];
+    const name=((row[0]||'').toString().trim()).toUpperCase();
+    if(!name) continue;
+    for(let c=1;c<row.length;c++){
+      const shift=(row[c]||'').toString().trim();
+      if(!/^1/.test(shift)) continue;          // turno mattina = inizia con 1
+      const date=colDate[c]; if(!date) continue;
+      const dow=date.getDay();                // 3=mer, 4=gio
+      if(dow!==3 && dow!==4) continue;
+      (candidates[name]=candidates[name]||[]).push(date);
+    }
+  }
+  Object.keys(candidates).forEach(k=>candidates[k].sort((a,b)=>a-b));
+  dbg.peopleWithShifts=Object.keys(candidates).length;
+
+  /* --- 2. Scadenze ---------------------------------------------------------------- */
+  const sheetScad = wbScad.Sheets[wbScad.SheetNames[0]];
+  const S = XLSX.utils.sheet_to_json(sheetScad,{raw:true,cellDates:true,defval:''});
+  dbg.totalRowsScadenze=S.length;
+
+  const out=[];
+  const z=n=>('0'+n).slice(-2);
+  const fmt=d=>z(d.getDate())+'/'+z(d.getMonth()+1)+'/'+d.getFullYear();
+
+  S.forEach(r=>{
+    const raw=(r.Nome||r.NOME||r[0]||'').toString().trim();
+    if(!raw) return;                          // salta righe vuote
+    const key=raw.toUpperCase();
+
+    let expiry=r.Scadenza||r.SCADENZA||r[1]||'';
+    if(typeof expiry==='string' && expiry) expiry=parseDate(expiry);
+    if(!(expiry instanceof Date) || isNaN(expiry)) return;
+
+    const list=(candidates[key]||[]).filter(d=>d<=expiry - bufDays*oneDay);
+    const visit=list.length ? (strat==='earliest' ? list[0] : list[list.length-1]) : null;
+    out.push({Nome:raw, Scadenza:fmt(expiry), Visita:visit?fmt(visit):'ND'});
+  });
+
+  dbg.resultRows=out.length;
+  return {rows:out, debug:dbg};
+}
+
+/* === UTILITÀ ======================================================================= */
+function parseDate(s){
+  //  gg/mm/aaaa  o  gg-mm-aaaa
+  let m=s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if(m) return new Date(+m[3], +m[2]-1, +m[1]);
+  //  aaaa-mm-gg
+  m=s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+  if(m) return new Date(+m[1], +m[2]-1, +m[3]);
+  // fallback (lascia sperare che JS la capisca)
+  return new Date(s);
+}
+const esc=s=>s.replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+
+function table(rows){
+  const div=document.getElementById('output');
+  let h='<table><thead><tr><th>Nome</th><th>Scadenza</th><th>Visita consigliata</th></tr></thead><tbody>';
+  rows.forEach(r=>{
+    h+=`<tr><td>${esc(r.Nome)}</td><td>${esc(r.Scadenza)}</td><td>${esc(r.Visita)}</td></tr>`;
+  });
+  h+='</tbody></table>';
+  div.innerHTML=h;
+}
+function download(rows){
+  const ws=XLSX.utils.json_to_sheet(rows);
+  const wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,ws,'Visite');
+  const blob=new Blob([XLSX.write(wb,{type:'array',bookType:'xlsx'})]);
+  const url=URL.createObjectURL(blob);
+  let a=document.getElementById('downloadLink');
+  if(!a){
+    a=document.createElement('a');
+    a.id='downloadLink';
+    a.textContent='Scarica risultati (.xlsx)';
+    document.getElementById('output').appendChild(a);
+  }
+  a.href=url;
+  a.download='visite_programmate.xlsx';
+}
+function clearOut(){document.getElementById('output').innerHTML='';}
+function err(msg){document.getElementById('output').innerHTML='<p class="error">'+msg+'</p>';}
+</script>
+</body>
+</html>

@@ -1,0 +1,151 @@
+<!-- ===========================================
+     Scheduler visite mediche  –  v7  (seriali date fix)
+     =========================================== -->
+<!DOCTYPE html><html lang="it"><head><meta charset="utf-8">
+<title>Scheduler visite mediche</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;margin:20px;max-width:900px;}
+label{display:block;margin:6px 0;} table{border-collapse:collapse;width:100%;margin-top:20px;font-size:14px;}
+th,td{border:1px solid #999;padding:6px;text-align:left;} th{background:#eee;}
+.error{color:#b00;font-weight:bold;margin-top:12px;} #debug{font-size:12px;white-space:pre;color:#555;margin-top:12px;}
+</style></head><body>
+<h2>Scheduler visite mediche</h2>
+<label>File turni:        <input type="file" id="fTurni" accept=".xls,.xlsx,.xlsm"></label>
+<label>File scadenze:     <input type="file" id="fScad"  accept=".xls,.xlsx"></label>
+<label>Anno calendario (0 = auto): <input type="number" id="year" value="0"></label>
+<label>Strategia:
+  <select id="strategy"><option value="latest">Più avanti possibile</option><option value="earliest">Prima possibile</option></select>
+</label>
+<label>Giorni di anticipo minimo: <input type="number" id="buffer" value="0"></label>
+<label><input type="checkbox" id="allowAfter"> Consenti date DOPO la scadenza se prima non ce ne sono</label>
+<button id="run" type="button">Calcola</button>
+
+<div id="out"></div><div id="debug"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+<script>if(typeof XLSX==='undefined'){const s=document.createElement('script');s.src='./xlsx.full.min.js';document.head.appendChild(s);}</script>
+
+<script>
+/* ==== CLICK HANDLER ========================================================== */
+document.getElementById('run').onclick = async () => {
+  clearOut();
+  if(typeof XLSX==='undefined'){ err('Libreria XLSX non caricata'); return; }
+
+  const tFile = fTurni.files[0], sFile = fScad.files[0];
+  if(!tFile || !sFile){ err('Seleziona entrambi i file'); return; }
+
+  const strat = strategy.value, buf = +buffer.value||0,
+        allow = document.getElementById('allowAfter').checked;
+
+  const wbT = await toWb(tFile), wbS = await toWb(sFile);
+  const yIn = +year.value || 0, years = yIn ? [yIn] : [2024,2025,2026,2027,2028,2029];
+
+  for(const yr of years){
+    const {rows,dbg} = calc(wbT,wbS,yr,strat,buf,allow);
+    showDebug(dbg);
+    if(rows.length){ makeTable(rows); makeDownload(rows); return; }
+  }
+  err('Nessun risultato con gli anni testati');
+};
+
+/* ==== SUPPORT =============================================================== */
+async function toWb(f){ return XLSX.read(await f.arrayBuffer(),{type:'array'}); }
+
+function excelSerialToDate(n){             /* 30 dic 1899 + n giorni */
+  return new Date(Date.UTC(1899,11,30 + n));
+}
+
+function calc(wbT, wbS, year, strat, bufDays, allowAfter){
+  const dbg={}, dayMs=86400000;
+  const T = XLSX.utils.sheet_to_json(wbT.Sheets[wbT.SheetNames[0]],{header:1,raw:false});
+
+  /* --- trova la riga con >=5 numeri 1-31 --- */
+  let dayRow=-1;
+  for(let r=0;r<T.length&&dayRow<0;r++){
+    if(T[r].filter(c=>/^\d{1,2}$/.test((c||'').trim())).length>=5) dayRow=r;
+  }
+  if(dayRow<0) throw 'Numeri giorno non trovati';
+
+  const colDate={}, cells=T[dayRow]; let m=0;
+  for(let c=1;c<cells.length;c++){
+    const v=(cells[c]||'').trim(); if(!/^\d{1,2}$/.test(v))continue;
+    const d=+v; if(d===1&&c!==1)m++; colDate[c]=new Date(year,m,d);
+  }
+  dbg.columns=Object.keys(colDate).length;
+
+  const cand={};
+  for(let r=dayRow+1;r<T.length;r++){
+    const name=((T[r][0]||'').trim()).toUpperCase(); if(!name)continue;
+    for(let c=1;c<T[r].length;c++){
+      if(!/^1/.test((T[r][c]||'').trim()))continue;
+      const dt=colDate[c]; if(!dt)continue;
+      const dow=dt.getDay(); if(dow!==3&&dow!==4)continue;
+      (cand[name]=cand[name]||[]).push(dt);
+    }
+  }
+  Object.values(cand).forEach(a=>a.sort((a,b)=>a-b));
+  dbg.people=Object.keys(cand).length;
+
+  /* ---------- scadenze ---------- */
+  const S = XLSX.utils.sheet_to_json(
+              wbS.Sheets[wbS.SheetNames[0]],
+              {raw:true,cellDates:true,defval:''});
+
+  let okDates=0;
+  const rows=[], z=n=>('0'+n).slice(-2), fmt=d=>z(d.getDate())+'/'+z(d.getMonth()+1)+'/'+d.getFullYear();
+
+  S.forEach(r=>{
+    const raw=(r.Nome||r.NOME||r[0]||'').trim(); if(!raw)return;
+    const key=Object.keys(cand).find(k=>k.startsWith(raw.toUpperCase())); if(!key)return;
+
+    let exp=r.Scadenza||r.SCADENZA||r[1];
+    if(typeof exp==='number') exp=excelSerialToDate(exp);      /* <-- FIX */
+    else if(typeof exp==='string') exp=parseDate(exp);
+
+    if(!(exp instanceof Date)||isNaN(exp))return;
+    okDates++;
+
+    let list=cand[key].filter(d=>d<=exp-bufDays*dayMs);
+    if(!list.length&&allowAfter) list=cand[key].filter(d=>d>exp);
+    if(!list.length) return;
+
+    const choose = (strat==='earliest')?list[0]:list[list.length-1];
+    rows.push({Nome:raw,Scadenza:fmt(exp),Visita:fmt(choose)});
+  });
+
+  dbg.validScadenze=okDates;
+  dbg.output=rows.length; dbg.year=year;
+  return {rows, dbg};
+}
+
+/* ----------- util ----------------------------------------------------------- */
+function parseDate(s){
+  let m=s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if(m) return new Date(+m[3],+m[2]-1,+m[1]);
+  m=s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+  if(m) return new Date(+m[1],+m[2]-1,+m[3]);
+  return new Date(s);
+}
+function makeTable(rows){let h='<table><tr><th>Nome</th><th>Scadenza</th><th>Visita</th></tr>';
+  rows.forEach(r=>h+=`<tr><td>${r.Nome}</td><td>${r.Scadenza}</td><td>${r.Visita}</td></tr>`); h+='</table>';
+  document.getElementById('out').innerHTML=h;
+}
+function makeDownload(rows){
+  const ws=XLSX.utils.json_to_sheet(rows),wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,ws,'Visite');
+  const url=URL.createObjectURL(new Blob([XLSX.write(wb,{type:'array',bookType:'xlsx'})]));
+  const a=document.createElement('a');a.textContent='Scarica risultati (.xlsx)';a.href=url;a.download='visite_programmate.xlsx';
+  document.getElementById('out').appendChild(a);
+}
+function showDebug(d){
+  document.getElementById('debug').textContent =
+`Anno analizzato:                ${d.year}
+Colonne con date mappate:       ${d.columns}
+Dipendenti con mer/giov mattina:${d.people}
+Scadenze valide parse-ate:      ${d.validScadenze}
+Righe di output finali:         ${d.output}`;
+}
+function err(m){document.getElementById('out').innerHTML='<p class="error">'+m+'</p>';}
+function clearOut(){document.getElementById('out').innerHTML='';document.getElementById('debug').textContent='';}
+</script>
+</body></html>

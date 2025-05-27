@@ -1,0 +1,123 @@
+<!DOCTYPE html><html lang="it"><head><meta charset="utf-8">
+<title>Scheduler visite mediche (v11)</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;margin:20px;max-width:900px;}
+label{display:block;margin:6px 0;} table{border-collapse:collapse;width:100%;margin-top:20px;font-size:13px;}
+th,td{border:1px solid #999;padding:6px;text-align:left;} th{background:#eee;}
+.error{color:#b00;font-weight:bold;margin-top:12px;} #debug{font-size:12px;white-space:pre;color:#555;margin-top:12px;}
+</style></head><body>
+<h2>Scheduler visite mediche</h2>
+
+<label>File turni: <input type="file" id="fTurni" accept=".xls,.xlsx,.xlsm"></label>
+<label>File scadenze: <input type="file" id="fScad" accept=".xls,.xlsx"></label>
+<label>Anno calendario (0 = auto): <input type="number" id="year" value="0"></label>
+<label>Strategia:
+  <select id="strategy"><option value="latest">Più avanti possibile</option><option value="earliest">Prima possibile</option></select>
+</label>
+<label>Giorni di anticipo minimo: <input type="number" id="buffer" value="0"></label>
+<label><input type="checkbox" id="allowAfter"> Consenti date DOPO la scadenza se prima non ce ne sono</label>
+
+<button id="run">Calcola</button>
+
+<div id="out"></div><div id="debug"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+<script>
+if(typeof XLSX==='undefined'){const s=document.createElement('script');s.src='./xlsx.full.min.js';document.head.appendChild(s);}
+
+run.onclick = async () => {
+  clearUI();
+  if(typeof XLSX==='undefined'){showErr('XLSX non caricata');return;}
+  const tFile=fTurni.files[0], sFile=fScad.files[0];
+  if(!tFile||!sFile){showErr('Seleziona entrambi i file');return;}
+
+  const wbT=XLSX.read(await tFile.arrayBuffer(),{type:'array'});
+  const wbS=XLSX.read(await sFile.arrayBuffer(),{type:'array'});
+  const strat=strategy.value, buf=+buffer.value||0, allow=allowAfter.checked;
+  const years=(+year.value)||0 ? [+year.value] : [2024,2025];
+
+  for(const yr of years){
+    const {rows,dbg}=compute(wbT,wbS,yr,strat,buf,allow);
+    showDebug(dbg);
+    if(rows.some(r=>r.Visita!=='ND')){render(rows);exportXlsx(rows);window.lastRows=rows;return;}
+  }
+  showErr('Nessuna visita possibile con i vincoli attuali');
+};
+
+/* ---------------- compute -------------------------------------------------- */
+function compute(wbT,wbS,year,strat,bufDays,allowAfter){
+  const rows=[], dbg={}, dayMs=86400000,
+        today=new Date(); today.setHours(0,0,0,0);
+  const maxDay=new Date('2025-12-31');
+
+  /* ------ colonna → data (pas à pas) ------ */
+  const T=XLSX.utils.sheet_to_json(wbT.Sheets[wbT.SheetNames[0]],{header:1,raw:false});
+  let dayRow=-1, firstCol=-1, firstDay=1, month=0;
+  for(let r=0;r<T.length;r++){
+    for(let c=1;c<T[r].length;c++){
+      const v=(T[r][c]||'').trim();
+      if(/^\d{1,2}$/.test(v)){ dayRow=r; firstCol=c; firstDay=+v; break; }
+    }
+    if(dayRow>-1) break;
+  }
+  if(dayRow==-1){throw'Numeri giorno non trovati';}
+
+  const colDate={}, startDate=new Date(year,month,firstDay);
+  for(let c=firstCol, d=startDate; c<T[dayRow].length; c++, d=new Date(d.getTime()+dayMs)){
+    colDate[c]=d;
+  }
+  dbg.columns=Object.keys(colDate).length;
+
+  /* ------ candidati turno1 mer/giov ------ */
+  const cand={};
+  for(let r=dayRow+1;r<T.length;r++){
+    const name=((T[r][0]||'').trim()).toUpperCase(); if(!name)continue;
+    for(const cStr of Object.keys(colDate)){
+      const c=+cStr, dt=colDate[c];
+      if(dt<today||dt>maxDay)continue;
+      const dow=dt.getDay(); if(dow!==3&&dow!==4)continue;
+      const code=(T[r][c]||'').trim(); if(!/^1/.test(code))continue;
+      (cand[name]=cand[name]||[]).push(dt);
+    }
+  }
+  Object.values(cand).forEach(a=>a.sort((a,b)=>a-b));
+  dbg.people=Object.keys(cand).length;
+
+  /* ------ scadenze ------ */
+  const S=XLSX.utils.sheet_to_json(wbS.Sheets[wbS.SheetNames[0]],{raw:true,cellDates:true,defval:''});
+  const fmt=d=>(`${d.getDate()}`.padStart(2,'0')+'/'+`${d.getMonth()+1}`.padStart(2,'0')+'/'+d.getFullYear());
+  let ok=0;
+
+  S.forEach(r=>{
+    const raw=(r.Nome||r.NOME||r[0]||'').trim(); if(!raw)return;
+    const key=Object.keys(cand).find(k=>k.startsWith(raw.toUpperCase()));
+    let exp=r.Scadenza||r.SCADENZA||r[1];
+    if(typeof exp==='number') exp=excelSerialToDate(exp);
+    else if(typeof exp==='string') exp=parseDate(exp);
+    if(!(exp instanceof Date)||isNaN(exp)) return;
+    ok++;
+
+    let visita='ND';
+    if(key){
+      let list=cand[key].filter(d=>d<=exp - bufDays*dayMs);
+      if(!list.length&&allowAfter) list=cand[key].filter(d=>d>exp);
+      if(list.length){
+        visita=fmt(strat==='earliest'?list[0]:list[list.length-1]);
+      }
+    }
+    rows.push({Nome:raw,Scadenza:fmt(exp),Visita:visita});
+  });
+
+  dbg.validScadenze=ok; dbg.output=rows.filter(r=>r.Visita!=='ND').length; dbg.year=year;
+  return {rows,dbg};
+}
+
+/* ---------------- helpers -------------------------------------------------- */
+function excelSerialToDate(n){return new Date(Date.UTC(1899,11,30+n));}
+function parseDate(s){const m=s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);if(m)return new Date(+m[3],+m[2]-1,+m[1]);const m2=s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);if(m2)return new Date(+m2[1],+m2[2]-1,+m2[3]);return new Date(s);}
+function render(rows){let h='<table><tr><th>Nome</th><th>Scadenza</th><th>Visita</th></tr>';rows.forEach(r=>h+=`<tr><td>${r.Nome}</td><td>${r.Scadenza}</td><td>${r.Visita}</td></tr>`);h+='</table>';out.innerHTML=h;}
+function exportXlsx(rows){const ws=XLSX.utils.json_to_sheet(rows),wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Visite');const url=URL.createObjectURL(new Blob([XLSX.write(wb,{type:'array',bookType:'xlsx'})]));const a=document.createElement('a');a.textContent='Scarica risultati (.xlsx)';a.href=url;a.download='visite_programmate.xlsx';out.appendChild(a);}
+function showDebug(d){debug.textContent=`Anno: ${d.year}\nColonne: ${d.columns}\nDipendenti con turno1 mer/giov: ${d.people}\nScadenze valide: ${d.validScadenze}\nRighe con visita: ${d.output}`;}
+function showErr(m){out.innerHTML=`<p class="error">${m}</p>`;}
+function clearUI(){out.innerHTML='';debug.textContent='';}
+</script></body></html>

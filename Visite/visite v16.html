@@ -1,0 +1,94 @@
+<!DOCTYPE html><html lang="it"><head><meta charset="utf-8">
+<title>Scheduler visite mediche (v14)</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;margin:20px;max-width:950px;}
+label{display:block;margin:6px 0;} table{border-collapse:collapse;width:100%;margin-top:16px;font-size:13px;}
+th,td{border:1px solid #999;padding:6px;} th{background:#eee;}
+.err{color:#b00;font-weight:bold;margin-top:12px;}
+#dbg{white-space:pre;font-size:12px;color:#555;margin-top:12px;}
+</style></head><body>
+<h2>Scheduler visite mediche</h2>
+<label>File turni: <input type="file" id="fTurni"></label>
+<label>File scadenze: <input type="file" id="fScad"></label>
+<button id="run">Calcola</button>
+
+<div id="out"></div><div id="dbg"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+<script>
+function normName(s){
+  return (s||'')
+    .replace(/\s+/g,' ')           // spazi multipli
+    .replace(/[^A-ZÀ-Ü\s\.]/gi,'') // solo lettere, punto, spazio
+    .toUpperCase()
+    .match(/^[A-ZÀ-Ü]+ \S\./)?.[0] || '';
+}
+
+run.onclick = async () =>{
+  out.textContent=''; dbg.textContent='';
+  const tFile=fTurni.files[0], sFile=fScad.files[0];
+  if(!tFile||!sFile){out.innerHTML='<p class=err>Carica entrambi i file</p>';return;}
+
+  /* ---- leggi turni con getter (usa cell.w se v vuoto) ---- */
+  const wbT=XLSX.read(await tFile.arrayBuffer(),{type:'array'});
+  const wsT=wbT.Sheets[wbT.SheetNames[0]];
+  const T=XLSX.utils.sheet_to_json(wsT,{
+      header:1, defval:'', raw:false, blankrows:false,
+      value:cell=> (cell.v!==undefined && cell.v!=='') ? cell.v : (cell.w||'')
+  });
+
+  /* riga con numeri 1-31 */
+  let dayRow=-1, firstCol=-1, firstDay=1;
+  outer:for(let r=0;r<T.length;r++){
+    for(let c=1;c<T[r].length;c++){
+      if(/^\d{1,2}$/.test(T[r][c])){dayRow=r;firstCol=c;firstDay=+T[r][c];break outer;}
+    }
+  }
+  if(dayRow<0){out.innerHTML='<p class=err>Numeri giorno non trovati</p>';return;}
+
+  /* mappa colonna→data incrementale */
+  const year=2025, oneDay=86400000, colDate={}, today=new Date(); today.setHours(0,0,0,0);
+  const maxDay=new Date('2025-12-31');
+  for(let c=firstCol,d=new Date(year,0,firstDay); c<T[dayRow].length; c++,d=new Date(+d+oneDay)){
+    colDate[c]=d;
+  }
+
+  /* candidati turno1 mer/giov */
+  const cand={}, unmatchedTurni=[];
+  for(let r=dayRow+1;r<T.length;r++){
+    const rawName=T[r][firstCol-1]||''; const key=normName(rawName);
+    if(!key){unmatchedTurni.push(rawName); continue;}
+    for(const [cStr,dt] of Object.entries(colDate)){
+      const c=+cStr; if(dt<today||dt>maxDay)continue;
+      if([3,4].indexOf(dt.getDay())===-1)continue;
+      const cell=(T[r][c]||'').toString(); if(!/^1/.test(cell))continue;
+      (cand[key]=cand[key]||[]).push(dt);
+    }
+  }
+
+  /* leggi scadenze */
+  const wbS=XLSX.read(await sFile.arrayBuffer(),{type:'array',cellDates:true});
+  const S=XLSX.utils.sheet_to_json(wbS.Sheets[wbS.SheetNames[0]],{raw:true,defval:''});
+
+  const rows=[], notFound=[];
+  const fmt=d=>`${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
+
+  S.forEach(r=>{
+    const raw=(r.Nome||r[0]||'').trim(); const keyNorm=normName(raw);
+    let exp=r.Scadenza||r[1];
+    if(typeof exp==='number'){const o=XLSX.SSF.parse_date_code(exp);exp=new Date(o.y,o.m-1,o.d);}
+    if(!(exp instanceof Date)||isNaN(exp)){notFound.push(raw);return;}
+
+    const list=cand[keyNorm]?.filter(d=>d<=exp) || [];
+    rows.push({Nome:raw,Scadenza:fmt(exp),Visita:list.length?fmt(list[list.length-1]):'ND'});
+  });
+
+  /* render */
+  out.innerHTML=XLSX.utils.sheet_to_html(XLSX.utils.json_to_sheet(rows));
+  dbg.textContent=
+`Colonne totali: ${T[dayRow].length}
+Dipendenti con turno1 mer/giov: ${Object.keys(cand).length}
+Visite assegnate: ${rows.filter(r=>r.Visita!=='ND').length}
+Nomi in scadenze non trovati nei turni: ${notFound.length > 0 ? notFound.join(', ') : '-'}`;
+};
+</script></body></html>

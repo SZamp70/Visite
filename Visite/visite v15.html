@@ -1,0 +1,72 @@
+<!-- Scheduler visite mediche – v13-fix (legge cell.w se v vuoto) -->
+<!DOCTYPE html><html lang="it"><head><meta charset="utf-8">
+<title>Scheduler visite mediche</title>
+<style>body{font-family:Arial,sans-serif;margin:20px;max-width:900px;}table{border-collapse:collapse;width:100%;margin-top:16px;font-size:13px;}th,td{border:1px solid #999;padding:6px;}th{background:#eee;}#dbg{white-space:pre;font-size:12px;color:#555;margin-top:12px}.err{color:#b00;font-weight:bold}</style>
+</head><body>
+<h2>Scheduler visite mediche</h2>
+<label>File turni: <input type="file" id="turni"></label>
+<label>File scadenze: <input type="file" id="scad"></label>
+<button id="go">Calcola</button>
+<div id="out"></div><div id="dbg"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+<script>
+go.onclick=async()=>{
+  out.textContent='';dbg.textContent='';
+  const fT=turni.files[0],fS=scad.files[0];
+  if(!fT||!fS){out.innerHTML='<p class=err>Carica entrambi i file</p>';return;}
+
+  /* ---- lettura con getter personalizzato ---- */
+  const wbT=XLSX.read(await fT.arrayBuffer(),{type:'array',cellText:false,cellDates:false});
+  const wsT=wbT.Sheets[wbT.SheetNames[0]];
+  const T=XLSX.utils.sheet_to_json(wsT,{header:1,defval:'',raw:false,
+    blankrows:false,
+    /* getter: se v è falsy, usa w */
+    cellText:false, cellNF:false,
+    cellHTML:false, /* valuemap */
+    /**
+     * opts: { cell: cellObject, row: r, col: c }
+     */
+    value:(cell)=> (cell.v!==undefined && cell.v!=='') ? cell.v : (cell.w||'')
+  });
+
+  /* ---- individua riga numeri ---- */
+  let dayRow=-1; for(let r=0;r<T.length;r++){
+    if(T[r].filter(x=>/^\d{1,2}$/.test(x)).length>=5){dayRow=r;break;}
+  }
+  if(dayRow<0){out.innerHTML='<p class=err>Numeri giorno non trovati</p>';return;}
+
+  /* mappa col->date */
+  const one=86400000, year=2025, colDate={}, firstCol=T[dayRow].findIndex(x=>/^\d{1,2}$/.test(x));
+  let d=new Date(year,0,1);
+  for(let c=firstCol;c<T[dayRow].length;c++,d=new Date(+d+one)) colDate[c]=d;
+
+  /* candidati turno1 mer/giov */
+  const cand={}, today=new Date(); today.setHours(0,0,0,0);
+  for(let r=dayRow+1;r<T.length;r++){
+    const name=(T[r][firstCol-1]||'').trim().toUpperCase(); if(!name)continue;
+    for(let c=firstCol;c<T[r].length;c++){
+      const dt=colDate[c]; if(!dt||dt<today||dt>new Date('2025-12-31'))continue;
+      if([3,4].indexOf(dt.getDay())===-1)continue;
+      const cell=(T[r][c]||'').toString().trim(); if(!/^1/.test(cell))continue;
+      (cand[name]=cand[name]||[]).push(dt);
+    }
+  }
+
+  /* scadenze */
+  const wbS=XLSX.read(await fS.arrayBuffer(),{type:'array',cellDates:true});
+  const S=XLSX.utils.sheet_to_json(wbS.Sheets[wbS.SheetNames[0]],{raw:true});
+  const fmt=d=>`${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
+  const rows=[];
+  S.forEach(r=>{
+    const raw=(r.Nome||r[0]||'').trim(), key=Object.keys(cand).find(k=>k.startsWith(raw.toUpperCase()));
+    let exp=r.Scadenza||r[1]; if(typeof exp==='number')exp=XLSX.SSF.parse_date_code(exp),exp=new Date(exp.y,exp.m-1,exp.d);
+    const list=key?cand[key].filter(dt=>dt<=exp):[];
+    rows.push({Nome:raw,Scadenza:fmt(exp),Visita:list.length?fmt(list[list.length-1]):'ND'});
+  });
+
+  /* render */
+  out.innerHTML=XLSX.utils.sheet_to_html(XLSX.utils.json_to_sheet(rows));
+  dbg.textContent=`Colonne: ${T[dayRow].length}\nDip. con turno1 mer/giov: ${Object.keys(cand).length}`;
+};
+</script></body></html>

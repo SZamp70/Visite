@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<title>Scheduler visite mediche</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;margin:20px;max-width:800px;}
+label{display:block;margin:6px 0;}
+table{border-collapse:collapse;width:100%;margin-top:20px;}
+th,td{border:1px solid #999;padding:6px;text-align:left;}
+th{background:#eee;}
+#downloadLink{display:inline-block;margin-top:12px;}
+.error{color:#b00;font-weight:bold;margin-top:12px;}
+</style>
+</head>
+<body>
+<h2>Scheduler visite mediche</h2>
+
+<p>
+Carica il file dei <strong>turni</strong> (<code>.xlsm/.xlsx</code>) e quello con le
+<strong>scadenze</strong> (<code>.xlsx</code>). Il calcolo avviene <em>interamente in locale</em>.<br>
+Se il tuo proxy blocca i CDN, metti il file <code>xslx.full.min.js</code> nella stessa cartella di questo HTML.
+</p>
+
+<label>File turni: <input type="file" id="turniFile" accept=".xls,.xlsx,.xlsm" required></label>
+<label>File scadenze: <input type="file" id="scadenzeFile" accept=".xls,.xlsx,.xlsm" required></label>
+<label>Anno di calendario (es. 2025): <input type="number" id="year" value="2025"></label>
+<label>Strategia:
+    <select id="strategy">
+        <option value="latest" selected>Più avanti possibile</option>
+        <option value="earliest">Prima possibile</option>
+    </select>
+</label>
+<label>Giorni di anticipo minimo: <input type="number" id="buffer" value="0"></label>
+<button type="button" id="runBtn">Calcola</button>
+
+<div id="output"></div>
+
+<!-- 1) Provo dal CDN -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+<!-- 2) Fallback locale -->
+<script>
+if(typeof XLSX==='undefined'){
+  var s=document.createElement('script');
+  s.src='./xlsx.full.min.js';
+  document.head.appendChild(s);
+}
+</script>
+
+<script>
+document.getElementById('runBtn').addEventListener('click',async()=>{
+  clearOut();
+  if(typeof XLSX==='undefined'){ err('La libreria XLSX non è stata caricata.'); return; }
+
+  const turni=document.getElementById('turniFile').files[0];
+  const scad =document.getElementById('scadenzeFile').files[0];
+  if(!turni||!scad){err('Seleziona entrambi i file.');return;}
+
+  const year  =+document.getElementById('year').value||2025;
+  const strat = document.getElementById('strategy').value;
+  const buf   =+document.getElementById('buffer').value||0;
+
+  try{
+    const tWb = await toWb(turni);
+    const sWb = await toWb(scad);
+    const res = calc(tWb,sWb,year,strat,buf);
+    if(!res.length){err('Nessun risultato – controlla il formato dei file.');return;}
+    table(res); download(res);
+  }catch(e){console.error(e);err('Errore: '+e.message);}
+});
+
+async function toWb(f){const b=await f.arrayBuffer();return XLSX.read(b,{type:'array'});}
+
+function findDayRow(d){
+  for(let r=0;r<d.length;r++){
+    let ok=0;
+    for(let c=1;c<d[r].length;c++){
+      if(/^\d{1,2}$/.test((d[r][c]||'').toString().trim())) ok++; else ok=0;
+      if(ok>=5) return r;
+    }
+  }
+  return -1;
+}
+
+function calc(tWb,sWb,year,strat,bufDays){
+  const t=XLSX.utils.sheet_to_json(tWb.Sheets[tWb.SheetNames[0]],{header:1,raw:false});
+  const dayRow=findDayRow(t);
+  if(dayRow===-1)throw new Error('Non trovo la riga con i numeri dei giorni.');
+
+  const drow=t[dayRow],ms=86400000,colDate={},m=()=>{};
+  let month=0;
+  for(let c=1;c<drow.length;c++){
+    const n=(drow[c]||'').toString().trim(); if(!/^\d{1,2}$/.test(n))continue;
+    const d=+n; if(d===1&&c!==1)month++; colDate[c]=new Date(year,month,d);
+  }
+
+  const cand={};
+  for(let r=dayRow+1;r<t.length;r++){
+    const row=t[r],name=((row[0]||'').toString().trim()).toUpperCase();
+    if(!name)continue;
+    for(let c=1;c<row.length;c++){
+      const sh=(row[c]||'').toString().trim(); if(!sh.startsWith('1'))continue;
+      const dt=colDate[c]; if(!dt)continue;
+      const dow=dt.getDay(); if(dow!==3&&dow!==4)continue;
+      (cand[name]=cand[name]||[]).push(dt);
+    }
+  }
+  Object.keys(cand).forEach(k=>cand[k].sort((a,b)=>a-b));
+
+  const scad=XLSX.utils.sheet_to_json(sWb.Sheets[sWb.SheetNames[0]],{raw:true,cellDates:true,defval:''});
+  const out=[],z=n=>('0'+n).slice(-2);
+  const fmt=d=>z(d.getDate())+'/'+z(d.getMonth()+1)+'/'+d.getFullYear();
+
+  scad.forEach(r=>{
+    const raw=(r.Nome||r.NOME||r[0]||'').toString().trim(); if(!raw)return;
+    const key=raw.toUpperCase();
+    let exp=r.Scadenza||r.SCADENZA||r[1]||'';
+    if(typeof exp==='string'&&exp)exp=parse(exp);
+    if(!(exp instanceof Date)||isNaN(exp))return;
+    const list=(cand[key]||[]).filter(d=>d<=exp-bufDays*ms);
+    const vis=list.length?(strat==='earliest'?list[0]:list[list.length-1]):null;
+    out.push({Nome:raw,Scadenza:fmt(exp),Visita:vis?fmt(vis):'ND'});
+  });
+  return out;
+}
+
+function parse(s){
+  const m=s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if(m)return new Date(+m[3],+m[2]-1,+m[1]);
+  const m2=s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+  if(m2)return new Date(+m2[1],+m2[2]-1,+m2[3]);
+  return new Date(s);
+}
+
+function table(rows){
+  const o=document.getElementById('output');
+  let h='<table><thead><tr><th>Nome</th><th>Scadenza</th><th>Visita consigliata</th></tr></thead><tbody>';
+  rows.forEach(r=>h+=`<tr><td>${esc(r.Nome)}</td><td>${esc(r.Scadenza)}</td><td>${esc(r.Visita)}</td></tr>`);
+  h+='</tbody></table>'; o.innerHTML=h;
+}
+
+function download(rows){
+  const ws=XLSX.utils.json_to_sheet(rows),wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,ws,'Visite');
+  const blob=new Blob([XLSX.write(wb,{type:'array',bookType:'xlsx'})]);
+  const url=URL.createObjectURL(blob);
+  let a=document.getElementById('downloadLink');
+  if(!a){a=document.createElement('a');a.id='downloadLink';a.textContent='Scarica risultati (.xlsx)';document.getElementById('output').appendChild(a);}
+  a.href=url;a.download='visite_programmate.xlsx';
+}
+
+function esc(s){return s.replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+function clearOut(){document.getElementById('output').innerHTML='';}
+function err(msg){document.getElementById('output').innerHTML='<p class="error">'+msg+'</p>';}
+</script>
+</body>
+</html>

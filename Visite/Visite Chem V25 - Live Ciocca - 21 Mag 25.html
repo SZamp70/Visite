@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <title>Visite Idoneità v36</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.17.5/xlsx.full.min.js"></script>
+  <style>
+    /* Font & Base */
+    @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
+    body { font-family: 'Roboto', sans-serif; background: #f0f2f5; margin: 0; padding: 0; display: flex; justify-content: center; align-items: flex-start; min-height: 100vh; }
+    .container { background: #fff; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 90%; max-width: 1000px; margin: 40px auto; padding: 20px; }
+    h1 { text-align: center; font-weight:700; color:#333; margin-top:0; }
+    h1 .emoji { margin: 0 5px; }
+    p { text-align: center; color: #555; margin-bottom: 30px; }
+    .file-inputs { display: flex; gap:20px; justify-content: center; flex-wrap: wrap; margin-top:20px; }
+    .file-inputs label { display:block; font-weight:500; margin-bottom:6px; }
+    .file-inputs input, .file-inputs select { border:1px solid #ccc; border-radius:4px; padding:6px; background:#fafafa; cursor:pointer; min-width:150px; }
+    .weekday-inputs { display: flex; gap:10px; justify-content: center; align-items: center; margin-top: 10px; }
+    .weekday-inputs label { font-weight:500; }
+    #processBtn { display:block; margin:20px auto; padding:10px 30px; font-size:16px; font-weight:500; color:#fff; background:#28a745; border:none; border-radius:4px; cursor:pointer; transition: background-color .3s; }
+    #processBtn:disabled { background:#94d3a2; cursor:not-allowed; }
+    #fileInfo { text-align:center; margin-top:10px; font-style:italic; color:#666; }
+    .warnings { margin-top:10px; color:#ff6b6b; font-size:14px; text-align:center; }
+    table { width:100%; border-collapse:collapse; margin-top:20px; font-size:14px; }
+    th, td { padding:12px; border:1px solid #e0e0e0; text-align:left; vertical-align:top; }
+    th { background:#28a745; color:#fff; position:sticky; top:0; z-index:1; }
+    tr:nth-child(even) { background:#f9f9f9; }
+    td div { margin-bottom:4px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1><span class="emoji">🩺</span> Visite Idoneità <span class="emoji">📅</span></h1>
+    <p>Carica i file Turni e Scadenze, seleziona il tipo di turno e i giorni della settimana disponibili.</p>
+    <div class="file-inputs">
+      <div><label for="turniInput">📕 File Turni</label><input type="file" id="turniInput" accept=".xls,.xlsx,.xlsm"></div>
+      <div><label for="visiteInput">📑 File Scadenze</label><input type="file" id="visiteInput" accept=".xls,.xlsx,.xlsm"></div>
+      <div><label for="shiftType">⏰ Tipo Turno</label><select id="shiftType"><option value="1">☀️ Mattutino (1)</option><option value="2">🌙 Pomeridiano (2)</option></select></div>
+    </div>
+    <div class="weekday-inputs">
+      <label>📆 Giorni:</label>
+      <label><input type="checkbox" value="1" checked> Lun</label>
+      <label><input type="checkbox" value="2" checked> Mar</label>
+      <label><input type="checkbox" value="3" checked> Mer</label>
+      <label><input type="checkbox" value="4" checked> Gio</label>
+      <label><input type="checkbox" value="5"> Ven</label>
+      <label><input type="checkbox" value="6"> Sab</label>
+      <label><input type="checkbox" value="0"> Dom</label>
+    </div>
+    <button id="processBtn" disabled>🚀 Elabora</button>
+    <div id="fileInfo"></div>
+    <div class="warnings" id="warnings"></div>
+    <table id="resultTable">
+      <thead>
+        <tr><th>👤 Persona</th><th>⏳ Scadenza</th><th>📋 Date Disponibili</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      // Verifica caricamento libreria XLSX
+      if (typeof XLSX === 'undefined') {
+        const warnDiv = document.getElementById('warnings');
+        const p = document.createElement('p');
+        p.className = 'warning';
+        p.textContent = "Errore: libreria XLSX non caricata. Controlla di aver consentito il caricamento di risorse esterne (CDN) o esegui l'app da un server HTTP.";
+        warnDiv.appendChild(p);
+        return;
+      }
+      // Imposta campi e listener
+      const mapMonth={GENNAIO:1,FEBBRAIO:2,MARZO:3,APRILE:4,MAGGIO:5,GIUGNO:6,LUGLIO:7,AGOSTO:8,SETTEMBRE:9,OTTOBRE:10,NOVEMBRE:11,DICEMBRE:12};
+      const mapWeekday={LUNEDI:1,MARTEDI:2,MERCOLEDI:3,GIOVEDI:4,VENERDI:5,SABATO:6,DOMENICA:0};
+      const today=new Date(); today.setHours(0,0,0,0);
+      let turniWb=null, visiteWb=null;
+      const tIn=document.getElementById('turniInput'), vIn=document.getElementById('visiteInput'), shiftSel=document.getElementById('shiftType'), btn=document.getElementById('processBtn'), warnDiv=document.getElementById('warnings'), infoDiv=document.getElementById('fileInfo');
+      const weekdayChecks = Array.from(document.querySelectorAll('.weekday-inputs input[type=checkbox]'));
+
+      function pad(n){return n<10?'0'+n:n;}      
+      function fmtDate(d){return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());}
+      function normalizeText(s){return String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase().trim();}
+      function warn(m){const p=document.createElement('p');p.className='warning';p.textContent=m;warnDiv.appendChild(p);}      
+      function checkReady(){btn.disabled = !(turniWb && visiteWb);}      
+      function loadFile(e,cb){const f=e.target.files[0]; if(!f) return; const r=new FileReader(); r.onload=ev=>cb(XLSX.read(new Uint8Array(ev.target.result),{type:'array',cellDates:true}), f.name); r.readAsArrayBuffer(f);}      
+      tIn.addEventListener('change', e=>loadFile(e,(wb,name)=>{turniWb = wb; infoDiv.textContent = `Turni: ${name}`; checkReady();}));
+      vIn.addEventListener('change', e=>loadFile(e,(wb,name)=>{visiteWb = wb; infoDiv.textContent += ` | Scadenze: ${name}`; checkReady();}));
+
+      btn.addEventListener('click', () => {
+        warnDiv.innerHTML = '';
+        // 1. Carica scadenze
+        const sheetV = visiteWb.Sheets[visiteWb.SheetNames[0]];
+        const rowsV = XLSX.utils.sheet_to_json(sheetV,{defval:null,raw:false});
+        const sample = rowsV[0] || {};
+        const headers = Object.keys(sample);
+        let userField=null, dateField=null;
+        headers.forEach(k=>{
+          const nk = normalizeText(k).replace(/\s+/g,'');
+          if(nk==='USERNAME') userField = k;
+          if(nk==='DATAPROSSIMAVISITA') dateField = k;
+        });
+        if(!userField||!dateField){ warn("Intentazioni 'username' o 'Data prossima visita' non trovate"); return; }
+        const deadlines = {};
+        rowsV.forEach((r,i)=>{
+          const nome = r[userField], scad = r[dateField];
+          if(!nome||!scad){ warn(`Riga ${i+2}: '${userField}' o '${dateField}' mancante`); return; }
+          const key = normalizeText(nome);
+          const dt = scad instanceof Date ? scad : new Date(scad);
+          if(isNaN(dt)){ warn(`Data non valida per ${nome}: ${scad}`); return; }
+          deadlines[key] = dt;
+        });
+        // 2. Estrai date candidate
+        const sheetT = turniWb.Sheets[turniWb.SheetNames[0]];
+        const range = XLSX.utils.decode_range(sheetT['!ref']);
+        const dateCols = [];
+        let currentMonth = null;
+        for(let C = range.s.c; C <= range.e.c; C++){
+          const mC = sheetT[XLSX.utils.encode_cell({r:1,c:C})];
+          if(mC && mC.v!=null){ const rawM = normalizeText(mC.v), num=parseInt(rawM,10); currentMonth=!isNaN(num)?num:(mapMonth[rawM]||currentMonth); }
+          if(!currentMonth) continue;
+          const wC = sheetT[XLSX.utils.encode_cell({r:2,c:C})], dC=sheetT[XLSX.utils.encode_cell({r:3,c:C})];
+          if(!wC||!dC) continue;
+          let wd = typeof wC.v==='number'?wC.v:(mapWeekday[normalizeText(wC.v)]||NaN);
+          const day = parseInt(dC.v,10);
+          if(!isNaN(wd) && !isNaN(day)){
+            const dt = new Date(2025, currentMonth-1, day);
+            if(dt>=today) dateCols.push({col:C,date:dt, wd});
+          }
+        }
+        // 3. Elabora risultati
+        const shiftCode = shiftSel.value;
+        const selectedDays = weekdayChecks.filter(ch=>ch.checked).map(ch=>parseInt(ch.value,10));
+        const rowsT = XLSX.utils.sheet_to_json(sheetT,{header:1,range:4,defval:null});
+        const results=[];
+        rowsT.forEach((r,i)=>{
+          const rawName = r[0]; if(!rawName) return;
+          let tn = normalizeText(rawName);
+          tn = tn.replace(/\s+([A-Z])\.?$/, '.$1');
+          const key = tn;
+          const dl = deadlines[key]; if(!dl){ warn(`Nessuna scadenza per ${rawName}`); return; }
+          const cand = dateCols.reduce((arr,dc)=>{
+            if(dc.date<=dl && selectedDays.includes(dc.wd)){
+              const cell = sheetT[XLSX.utils.encode_cell({r:i+4,c:dc.col})];
+              if(cell && String(cell.v).trim().startsWith(shiftCode)) arr.push(dc.date);
+            }
+            return arr;
+          },[]).sort((a,b)=>a-b);
+          results.push({name:rawName, deadline:fmtDate(dl), datesList:cand});
+        });
+        // 4. Render tabella
+        const tbody = document.querySelector('#resultTable tbody'); tbody.innerHTML='';
+        results.forEach(r=>{
+          const tr=document.createElement('tr');
+          tr.innerHTML = `
+            <td>${r.name}</td>
+            <td>${r.deadline}</td>
+            <td>${r.datesList.map(d=>`<div>${fmtDate(d)}</div>`).join('')}</td>
+          `;
+          tbody.appendChild(tr);
+        });
+      });
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,185 @@
+<!-- ===========================================
+     Scheduler visite mediche  –  v6-fix (2024)
+     =========================================== -->
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<title>Scheduler visite mediche</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;margin:20px;max-width:900px;}
+label{display:block;margin:6px 0;}
+table{border-collapse:collapse;width:100%;margin-top:20px;font-size:14px;}
+th,td{border:1px solid #999;padding:6px;text-align:left;} th{background:#eee;}
+.error{color:#b00;font-weight:bold;margin-top:12px;}
+#debug{font-size:12px;color:#555;margin-top:12px;white-space:pre;}
+</style>
+</head>
+<body>
+<h2>Scheduler visite mediche</h2>
+
+<label>File turni:        <input type="file" id="fTurni" accept=".xls,.xlsx,.xlsm"></label>
+<label>File scadenze:     <input type="file" id="fScad"  accept=".xls,.xlsx"></label>
+<label>Anno calendario (0 = auto): <input type="number" id="year" value="0"></label>
+<label>Strategia:
+  <select id="strategy">
+      <option value="latest">Più avanti possibile</option>
+      <option value="earliest">Prima possibile</option>
+  </select>
+</label>
+<label>Giorni di anticipo minimo: <input type="number" id="buffer" value="0"></label>
+<label><input type="checkbox" id="allowAfter"> Consenti date DOPO la scadenza se prima non ce ne sono</label>
+
+<button id="run" type="button">Calcola</button>
+
+<div id="out"></div>
+<div id="debug"></div>
+
+<!-- 1) Libreria XLSX dal CDN -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+<!-- 2) Fallback locale se il CDN è bloccato -->
+<script>
+if(typeof XLSX==='undefined'){
+  const s=document.createElement('script');
+  s.src='./xlsx.full.min.js';        /* metti questo file accanto all'HTML se serve */
+  document.head.appendChild(s);
+}
+</script>
+
+<script>
+document.getElementById('run').onclick = async () => {
+  clearOut();
+
+  if(typeof XLSX==='undefined'){ err('Libreria XLSX non caricata'); return; }
+
+  const fileTurni = fTurni.files[0];
+  const fileScad  = fScad.files[0];
+  if(!fileTurni || !fileScad){ err('Seleziona entrambi i file'); return; }
+
+  const strat = strategy.value;
+  const buf   = +buffer.value || 0;
+  const allowFlag = document.getElementById('allowAfter').checked;
+
+  const wbTurni = await toWb(fileTurni);
+  const wbScad  = await toWb(fileScad);
+
+  /* se year = 0 provo a indovinare quello giusto 2024-2029 */
+  const yInput = +year.value || 0;
+  const years  = yInput ? [yInput] : [2024,2025,2026,2027,2028,2029];
+
+  for(const yr of years){
+    const {rows, dbg} = calc(wbTurni, wbScad, yr, strat, buf, allowFlag);
+    showDebug(dbg);
+    if(rows.length){ makeTable(rows); makeDownload(rows); return; }
+  }
+  err('Nessun risultato con gli anni testati');
+};
+
+/* ===== funzioni di supporto =================================================== */
+async function toWb(f){ return XLSX.read(await f.arrayBuffer(), {type:'array'}); }
+
+function calc(wbT, wbS, year, strat, bufDays, allowAfter){
+  const dbg={}, dayMs = 86400000;
+
+  /* --- PARSE FOGLIO TURNI --------------------------------------------------- */
+  const T = XLSX.utils.sheet_to_json(wbT.Sheets[wbT.SheetNames[0]], {header:1, raw:false});
+  let dayRow = -1;
+  for(let r=0; r<T.length && dayRow<0; r++){
+    const nums = T[r].filter(c => /^\d{1,2}$/.test((c||'').trim())).length;
+    if(nums >= 5) dayRow = r;
+  }
+  if(dayRow < 0) throw 'Riga con i numeri dei giorni non trovata';
+
+  /* mappa colonna -> data vera */
+  const colDate = {}, nums = T[dayRow]; let month = 0;
+  for(let c=1; c<nums.length; c++){
+    const v = (nums[c]||'').trim();
+    if(!/^\d{1,2}$/.test(v)) continue;
+    const d = +v;
+    if(d===1 && c!==1) month++;
+    colDate[c] = new Date(year, month, d);
+  }
+  dbg.columns = Object.keys(colDate).length;
+
+  /* candidati: mer/giov con turno che inizia per 1 */
+  const cand = {};
+  for(let r=dayRow+1; r<T.length; r++){
+    const name = ((T[r][0]||'').trim()).toUpperCase(); if(!name) continue;
+    for(let c=1; c<T[r].length; c++){
+      if(!/^1/.test((T[r][c]||'').trim())) continue;
+      const dt = colDate[c]; if(!dt) continue;
+      const dow = dt.getDay(); if(dow!==3 && dow!==4) continue;
+      (cand[name] = cand[name] || []).push(dt);
+    }
+  }
+  Object.values(cand).forEach(arr => arr.sort((a,b)=>a-b));
+  dbg.people = Object.keys(cand).length;
+
+  /* --- PARSE FOGLIO SCADENZE ------------------------------------------------- */
+  const S = XLSX.utils.sheet_to_json(wbS.Sheets[wbS.SheetNames[0]], {raw:true, cellDates:true, defval:''});
+
+  const rows = [];
+  S.forEach(row=>{
+    const rawName = (row.Nome || row.NOME || row[0] || '').trim();
+    if(!rawName) return;
+
+    /* match “prefisso” */
+    const key = Object.keys(cand).find(k => k.startsWith(rawName.toUpperCase()));
+    if(!key) return;
+
+    /* scadenza */
+    let exp = row.Scadenza || row.SCADENZA || row[1];
+    if(typeof exp === 'string') exp = parseDate(exp);
+    if(!(exp instanceof Date) || isNaN(exp)) return;
+
+    /* filtra date: prima della scadenza (+buffer) */
+    let list = cand[key].filter(d => d <= exp - bufDays*dayMs);
+    if(!list.length && allowAfter) list = cand[key].filter(d => d > exp);
+
+    if(!list.length) return;   /* comunque niente da proporre */
+
+    const date = (strat === 'earliest') ? list[0] : list[list.length-1];
+    rows.push({Nome:rawName, Scadenza:fmt(exp), Visita:fmt(date)});
+  });
+
+  dbg.output = rows.length;
+  dbg.year   = year;
+  return {rows, dbg};
+}
+
+/* --- piccoli helper ---------------------------------------------------------- */
+function parseDate(s){
+  let m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if(m) return new Date(+m[3], +m[2]-1, +m[1]);
+  m = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+  if(m) return new Date(+m[1], +m[2]-1, +m[3]);
+  return new Date(s);
+}
+const z=n=>('0'+n).slice(-2), fmt=d=>z(d.getDate())+'/'+z(d.getMonth()+1)+'/'+d.getFullYear();
+
+function makeTable(rows){
+  let h='<table><tr><th>Nome</th><th>Scadenza</th><th>Visita consigliata</th></tr>';
+  rows.forEach(r=>h+=`<tr><td>${r.Nome}</td><td>${r.Scadenza}</td><td>${r.Visita}</td></tr>`);
+  h+='</table>'; document.getElementById('out').innerHTML = h;
+}
+function makeDownload(rows){
+  const ws=XLSX.utils.json_to_sheet(rows), wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,ws,'Visite');
+  const url=URL.createObjectURL(new Blob([XLSX.write(wb,{type:'array',bookType:'xlsx'})]));
+  const a=document.createElement('a');
+  a.textContent='Scarica risultati (.xlsx)'; a.href=url; a.download='visite_programmate.xlsx';
+  document.getElementById('out').appendChild(a);
+}
+
+function showDebug(dbg){
+  document.getElementById('debug').textContent =
+`Anno analizzato:                ${dbg.year}
+Colonne con data mappata:       ${dbg.columns}
+Dipendenti con mer/giov mattina:${dbg.people}
+Righe di output finali:         ${dbg.output}`;
+}
+function err(m){ document.getElementById('out').innerHTML = `<p class="error">${m}</p>`; }
+function clearOut(){ document.getElementById('out').innerHTML=''; document.getElementById('debug').textContent=''; }
+</script>
+</body>
+</html>
